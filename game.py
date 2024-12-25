@@ -8,6 +8,12 @@ import time
 import yaml
 import numpy as np
 import pygame.mixer as mixer
+from dataclasses import dataclass
+from typing import Dict, List, Set, TypeVar, Generic, Optional, Any
+from collections import defaultdict, deque
+import asyncio
+import psutil
+from contextlib import contextmanager
 
 # Initialize Pygame
 pygame.init()
@@ -239,14 +245,28 @@ class Game:
     def __init__(self):
         try:
             pygame.init()
-            # Initialize mixer for better sound latency
             pygame.mixer.pre_init(44100, -16, 2, 512)
             pygame.mixer.init()
             
             self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
             self.clock = pygame.time.Clock()
             
-            # Load sounds with adjusted volumes
+            # Initialize systems
+            self.world = World()
+            self.event_manager = EventManager()
+            self.resource_manager = ResourceManager()
+            self.profiler = Profiler()
+            self.scene_graph = SceneNode()
+            self.render_system = RenderSystem()
+            
+            # Game state
+            self.game_state = GameState.START
+            self.bird = None
+            self.pipes = []
+            self.score = 0
+            self.high_score = 0
+            
+            # Initialize sounds with adjusted volumes
             self.sounds = {
                 'wing': pygame.mixer.Sound('assets/audio/wing.wav'),
                 'hit': pygame.mixer.Sound('assets/audio/hit.wav'),
@@ -254,157 +274,159 @@ class Game:
                 'point': pygame.mixer.Sound('assets/audio/point.wav')
             }
             
-            # Set individual volumes (0.0 to 1.0)
-            self.sounds['wing'].set_volume(0.6)
-            self.sounds['hit'].set_volume(0.6)
-            self.sounds['die'].set_volume(0.6)
-            self.sounds['point'].set_volume(0.3)  # Reduced point sound volume
+            for sound in self.sounds.values():
+                sound.set_volume(0.3)
             
             self.reset_game()
-            self.game_state = GAME_STATE_START
-            self.high_score = 0
-            self.last_time = pygame.time.get_ticks()
+            
         except Exception as e:
             print(f"Error initializing game: {e}")
             self.cleanup()
             sys.exit(1)
 
-    def cleanup(self):
-        # Clean up sounds before quitting
-        pygame.mixer.quit()
-        pygame.quit()
-
-    def reset_game(self):
-        self.bird = Bird(WINDOW_WIDTH // 3, WINDOW_HEIGHT // 2)
-        self.pipes = []
-        self.last_pipe_x = WINDOW_WIDTH
-        self.score = 0
-
     def handle_events(self):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                pygame.quit()
+                self.cleanup()
                 sys.exit()
+                
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_SPACE:
-                    if self.game_state == GAME_STATE_START:
-                        self.game_state = GAME_STATE_PLAYING
-                    elif self.game_state == GAME_STATE_PLAYING:
-                        self.bird.jump()
-                    elif self.game_state == GAME_STATE_GAME_OVER:
-                        self.reset_game()
-                        self.game_state = GAME_STATE_PLAYING
+                    self.handle_space_press()
+                    
+            # Convert Pygame events to our event system
+            self.event_manager.emit(Event(
+                "pygame_event",
+                {"event": event}
+            ))
+
+    def handle_space_press(self):
+        if self.game_state == GameState.START:
+            self.game_state = GameState.PLAYING
+        elif self.game_state == GameState.PLAYING:
+            if self.bird:
+                self.bird.jump()
+                self.sounds['wing'].play()
+        elif self.game_state == GameState.GAME_OVER:
+            self.reset_game()
+            self.game_state = GameState.PLAYING
+
+    def reset_game(self):
+        # Create bird entity
+        bird_entity = self.world.create_entity()
+        self.bird = Bird(WINDOW_WIDTH // 3, WINDOW_HEIGHT // 2)
+        
+        # Add components to bird
+        self.world.add_component(bird_entity, Physics(
+            velocity=np.array([0.0, 0.0]),
+            acceleration=np.array([0.0, GRAVITY])
+        ))
+        self.world.add_component(bird_entity, Sprite(
+            surface=BIRD_SPRITES[0],
+            rect=self.bird.rect
+        ))
+        self.world.add_component(bird_entity, Animation(
+            frames=BIRD_SPRITES,
+            frame_duration=ANIMATION_SPEED
+        ))
+        
+        self.pipes = []
+        self.score = 0
+
+    def update(self):
+        with self.profiler.profile_scope("update"):
+            if self.game_state == GameState.PLAYING:
+                # Update game logic
+                current_time = pygame.time.get_ticks()
+                dt = (current_time - getattr(self, 'last_time', current_time)) / 1000.0
+                self.last_time = current_time
+                
+                # Update bird
+                if self.bird:
+                    self.bird.update(dt)
+                
+                # Update pipes
+                self.update_pipes()
+                
+                # Check collisions
+                if self.check_collisions():
+                    self.game_state = GameState.GAME_OVER
+                    self.sounds['hit'].play()
+                    self.sounds['die'].play()
+                
+                # Update systems
+                self.world.update()
+                self.profiler.update()
+
+    def update_pipes(self):
+        # Generate new pipes
+        if not self.pipes or self.pipes[-1].x <= WINDOW_WIDTH - PIPE_SPACING:
+            self.pipes.append(Pipe(WINDOW_WIDTH))
+        
+        # Update and remove off-screen pipes
+        for pipe in self.pipes[:]:
+            pipe.update()
+            if pipe.is_off_screen():
+                self.pipes.remove(pipe)
+            elif not pipe.passed and pipe.x + PIPE_WIDTH < self.bird.rect.x:
+                pipe.passed = True
+                self.score += 1
+                self.sounds['point'].play()
+
+    def check_collisions(self):
+        if self.bird:
+            return self.bird.check_collision(self.pipes)
+        return False
+
+    def draw(self):
+        with self.profiler.profile_scope("render"):
+            # Clear screen
+            self.screen.blit(BACKGROUND, (0, 0))
+            
+            # Draw game elements based on state
+            if self.game_state in [GameState.PLAYING, GameState.GAME_OVER]:
+                # Draw pipes
+                for pipe in self.pipes:
+                    pipe.draw(self.screen)
+                
+                # Draw bird
+                if self.bird:
+                    self.bird.draw(self.screen)
+                
+                # Draw score
+                self.draw_score(self.score, WINDOW_WIDTH//2, 50)
+            
+            # Draw state-specific overlays
+            if self.game_state == GameState.START:
+                self.draw_start_screen()
+            elif self.game_state == GameState.GAME_OVER:
+                self.draw_game_over_screen()
+            
+            pygame.display.flip()
 
     def draw_score(self, score, x, y):
-        # Convert score to string and get width of all digits
         score_str = str(score)
         total_width = sum(NUMBER_SPRITES[int(d)].get_width() for d in score_str)
-        
-        # Center the score horizontally at x
         current_x = x - total_width // 2
         
-        # Draw each digit
         for digit in score_str:
             digit_sprite = NUMBER_SPRITES[int(digit)]
             self.screen.blit(digit_sprite, (current_x, y))
-            current_x += digit_sprite.get_width() + 2  # Add small spacing between digits
+            current_x += digit_sprite.get_width()
 
-    def update(self):
-        if self.game_state != GAME_STATE_PLAYING:
-            return
+    def draw_start_screen(self):
+        msg_x = WINDOW_WIDTH//2 - START_MESSAGE.get_width()//2
+        msg_y = WINDOW_HEIGHT//2 - START_MESSAGE.get_height()//2
+        self.screen.blit(START_MESSAGE, (msg_x, msg_y))
 
-        # Calculate delta time
-        current_time = pygame.time.get_ticks()
-        dt = (current_time - self.last_time) / 1000.0
-        self.last_time = current_time
+    def draw_game_over_screen(self):
+        game_over_x = WINDOW_WIDTH//2 - GAME_OVER_SPRITE.get_width()//2
+        game_over_y = WINDOW_HEIGHT//3
+        self.screen.blit(GAME_OVER_SPRITE, (game_over_x, game_over_y))
 
-        # Generate new pipes
-        if not self.pipes or self.last_pipe_x - self.pipes[-1].x >= PIPE_SPACING:
-            new_pipe = Pipe(WINDOW_WIDTH)
-            self.pipes.append(new_pipe)
-            self.last_pipe_x = WINDOW_WIDTH
-
-        # Update bird and pipes with delta time
-        self.bird.update(dt)
-        
-        # Update and clean up pipes
-        for pipe in self.pipes[:]:
-            pipe.update()
-            # Check for score
-            if not pipe.passed and pipe.x + PIPE_WIDTH < self.bird.rect.x:
-                pipe.passed = True
-                self.score += 1
-                self.sounds['point'].play()  # Play point sound
-            
-            if pipe.is_off_screen():
-                self.pipes.remove(pipe)
-
-        # Check for collisions
-        if self.bird.check_collision(self.pipes):
-            self.sounds['hit'].play()  # Play hit sound
-            self.sounds['die'].play()  # Play die sound
-            self.game_state = GAME_STATE_GAME_OVER
-        elif (self.bird.rect.bottom >= WINDOW_HEIGHT or 
-              self.bird.rect.top <= 0):
-            self.sounds['hit'].play()  # Play hit sound for wall collision
-            self.game_state = GAME_STATE_GAME_OVER
-
-    def draw(self):
-        # Draw background
-        self.screen.blit(BACKGROUND, (0, 0))
-        
-        # Draw pipes and bird only during gameplay or game over
-        if self.game_state in [GAME_STATE_PLAYING, GAME_STATE_GAME_OVER]:
-            for pipe in self.pipes:
-                pipe.draw(self.screen)
-            self.bird.draw(self.screen)
-
-        # Draw score during gameplay
-        if self.game_state == GAME_STATE_PLAYING:
-            self.draw_score(self.score, WINDOW_WIDTH//2, 50)
-
-        # Draw start screen
-        elif self.game_state == GAME_STATE_START:
-            msg_x = WINDOW_WIDTH//2 - START_MESSAGE.get_width()//2
-            msg_y = WINDOW_HEIGHT//2 - START_MESSAGE.get_height()//2
-            self.screen.blit(START_MESSAGE, (msg_x, msg_y))
-
-        # Draw game over screen with just the score
-        elif self.game_state == GAME_STATE_GAME_OVER:
-            # Center the game over sprite vertically and horizontally
-            game_over_x = WINDOW_WIDTH//2 - GAME_OVER_SPRITE.get_width()//2
-            game_over_y = WINDOW_HEIGHT//3
-
-            # Draw game over text
-            self.screen.blit(GAME_OVER_SPRITE, (game_over_x, game_over_y))
-            
-            # Draw only the current score
-            score_y = game_over_y + GAME_OVER_SPRITE.get_height() + 50
-            self.draw_score(self.score, WINDOW_WIDTH//2, score_y)
-
-        pygame.display.flip()
-
-    def run(self):
-        previous_time = time.time()
-        lag = 0.0
-        MS_PER_UPDATE = 1.0 / self.FPS
-
-        while True:
-            current_time = time.time()
-            elapsed = current_time - previous_time
-            previous_time = current_time
-            lag += elapsed
-
-            self.handle_events()
-
-            # Update game logic at a fixed time step
-            while lag >= MS_PER_UPDATE:
-                self.update()
-                lag -= MS_PER_UPDATE
-
-            # Render at whatever frame rate we can achieve
-            self.draw()
-            self.clock.tick(self.FPS)
+    def cleanup(self):
+        pygame.mixer.quit()
+        pygame.quit()
 
 class ResourceLoader:
     @staticmethod
@@ -484,6 +506,158 @@ class PerformanceMonitor:
         if not self.frame_times:
             return 0
         return 1.0 / (sum(self.frame_times) / len(self.frame_times))
+
+@dataclass
+class Component:
+    """Base class for all components"""
+    pass
+
+@dataclass
+class Physics(Component):
+    velocity: np.ndarray
+    acceleration: np.ndarray
+    mass: float = 1.0
+
+@dataclass
+class Sprite(Component):
+    surface: pygame.Surface
+    rect: pygame.Rect
+    rotation: float = 0.0
+    layer: int = 0
+
+@dataclass
+class Animation(Component):
+    frames: List[pygame.Surface]
+    frame_duration: float
+    current_frame: int = 0
+    time_accumulated: float = 0.0
+
+class Entity:
+    def __init__(self, entity_id: int):
+        self.id = entity_id
+        self.components: Dict[type, Component] = {}
+
+class World:
+    def __init__(self):
+        self.entities: Dict[int, Entity] = {}
+        self.systems: List[System] = []
+        self.next_entity_id: int = 0
+        self.component_pools: Dict[type, Set[Entity]] = {}
+    
+    def create_entity(self) -> Entity:
+        entity = Entity(self.next_entity_id)
+        self.next_entity_id += 1
+        self.entities[entity.id] = entity
+        return entity
+    
+    def add_component(self, entity: Entity, component: Component):
+        component_type = type(component)
+        entity.components[component_type] = component
+        
+        if component_type not in self.component_pools:
+            self.component_pools[component_type] = set()
+        self.component_pools[component_type].add(entity)
+    
+    def update(self):
+        for system in self.systems:
+            system.update(self)
+
+class SceneNode:
+    def __init__(self):
+        self.children: List[SceneNode] = []
+        self.parent: Optional[SceneNode] = None
+        self.local_transform = np.eye(3)  # 3x3 transformation matrix
+        self._world_transform = None
+        
+    @property
+    def world_transform(self) -> np.ndarray:
+        if self._world_transform is None:
+            if self.parent:
+                self._world_transform = np.dot(
+                    self.parent.world_transform, 
+                    self.local_transform
+                )
+            else:
+                self._world_transform = self.local_transform.copy()
+        return self._world_transform
+
+class RenderSystem:
+    def __init__(self):
+        self.scene_root = SceneNode()
+        self.render_layers: Dict[int, List[Entity]] = defaultdict(list)
+        self.render_target = pygame.Surface(
+            (WINDOW_WIDTH, WINDOW_HEIGHT), 
+            flags=pygame.SRCALPHA | pygame.HWSURFACE | pygame.DOUBLEBUF
+        )
+
+class Event:
+    def __init__(self, event_type: str, data: Dict = None):
+        self.type = event_type
+        self.data = data or {}
+        self.timestamp = time.perf_counter()
+
+class EventManager:
+    def __init__(self):
+        self.listeners: Dict[str, List[callable]] = defaultdict(list)
+        self.event_queue = deque(maxlen=1000)
+        self.event_history = np.zeros((1000,), dtype=[
+            ('type', 'U32'),
+            ('timestamp', 'f8'),
+            ('entity_id', 'i4')
+        ])
+        self.history_index = 0
+        
+    def emit(self, event: Event):
+        self.event_queue.append(event)
+        self._record_event(event)
+        
+    def _record_event(self, event: Event):
+        self.event_history[self.history_index] = (
+            event.type,
+            event.timestamp,
+            event.data.get('entity_id', -1)
+        )
+        self.history_index = (self.history_index + 1) % 1000
+
+class ResourceManager:
+    def __init__(self):
+        self.cache: Dict[str, Any] = {}
+        self.loading_tasks: List[asyncio.Task] = []
+        self.preload_queue = asyncio.Queue()
+        
+    async def preload_resources(self, paths: List[str]):
+        for path in paths:
+            await self.preload_queue.put(path)
+            
+    async def _load_resource(self, path: str) -> Any:
+        if path.endswith(('.png', '.jpg')):
+            return await asyncio.to_thread(
+                lambda: pygame.image.load(path).convert_alpha()
+            )
+        elif path.endswith('.wav'):
+            return await asyncio.to_thread(
+                lambda: pygame.mixer.Sound(path)
+            )
+
+class Profiler:
+    def __init__(self):
+        self.timings = defaultdict(list)
+        self.memory_usage = []
+        self.process = psutil.Process()
+        
+    @contextmanager
+    def profile_scope(self, name: str):
+        start = time.perf_counter_ns()
+        try:
+            yield
+        finally:
+            duration = time.perf_counter_ns() - start
+            self.timings[name].append(duration / 1e6)  # Convert to milliseconds
+            
+    def update(self):
+        self.memory_usage.append(self.process.memory_info().rss / 1024 / 1024)
+        if len(self.memory_usage) > 1000:
+            self.memory_usage.pop(0)
 
 def main():
     pygame.init()
