@@ -1,0 +1,7 @@
+numpy>=1.21.0
+pytmx>=3.31
+pygame-gui>=0.6.4
+pyyaml>=5.4.1
+cython>=0.29.24
+particle>=0.10.0
+psutil>=5.8.0

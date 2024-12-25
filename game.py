@@ -5,6 +5,9 @@ import sys
 import random
 from enum import Enum, auto
 import time
+import yaml
+import numpy as np
+import pygame.mixer as mixer
 
 # Initialize Pygame
 pygame.init()
@@ -89,15 +92,21 @@ ANIMATION_SPEED = 0.15  # Time between frames in seconds
 
 class SoundManager:
     def __init__(self):
-        self.sounds = {
-            'wing': pygame.mixer.Sound('assets/audio/wing.wav'),
-            'point': pygame.mixer.Sound('assets/audio/point.wav'),
-            'hit': pygame.mixer.Sound('assets/audio/hit.wav'),
-            'die': pygame.mixer.Sound('assets/audio/die.wav')
-        }
-    
-    def play(self, sound_name):
-        self.sounds[sound_name].play()
+        mixer.pre_init(44100, -16, 2, 512)
+        mixer.init()
+        self.sounds = {}
+        self.music = {}
+        
+    def load_sound(self, name, path):
+        self.sounds[name] = mixer.Sound(path)
+        
+    def load_music(self, name, path):
+        self.music[name] = path
+        
+    def play_sound(self, name, volume=1.0):
+        if name in self.sounds:
+            self.sounds[name].set_volume(volume)
+            self.sounds[name].play()
 
 class Pipe:
     def __init__(self, x):
@@ -187,10 +196,43 @@ class Bird:
         screen.blit(rotated_sprite, rotated_rect)
 
     def check_collision(self, pipes):
+        # Convert bird corners to numpy array
+        bird_corners = np.array([
+            [self.rect.left, self.rect.top],
+            [self.rect.right, self.rect.top],
+            [self.rect.left, self.rect.bottom],
+            [self.rect.right, self.rect.bottom]
+        ])
+        
         for pipe in pipes:
-            if (self.rect.colliderect(pipe.top_pipe) or 
-                self.rect.colliderect(pipe.bottom_pipe)):
-                return True
+            # Create arrays for top and bottom pipe separately
+            top_pipe_rect = np.array([
+                pipe.top_pipe.left,
+                pipe.top_pipe.top,
+                pipe.top_pipe.right,
+                pipe.top_pipe.bottom
+            ])
+            
+            bottom_pipe_rect = np.array([
+                pipe.bottom_pipe.left,
+                pipe.bottom_pipe.top,
+                pipe.bottom_pipe.right,
+                pipe.bottom_pipe.bottom
+            ])
+            
+            # Check collision for each corner against each pipe
+            for corner in bird_corners:
+                x, y = corner
+                # Check if point is inside top pipe
+                if (x >= top_pipe_rect[0] and x <= top_pipe_rect[2] and
+                    y >= top_pipe_rect[1] and y <= top_pipe_rect[3]):
+                    return True
+                
+                # Check if point is inside bottom pipe
+                if (x >= bottom_pipe_rect[0] and x <= bottom_pipe_rect[2] and
+                    y >= bottom_pipe_rect[1] and y <= bottom_pipe_rect[3]):
+                    return True
+        
         return False
 
 class Game:
@@ -204,13 +246,19 @@ class Game:
             self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
             self.clock = pygame.time.Clock()
             
-            # Load sounds
+            # Load sounds with adjusted volumes
             self.sounds = {
                 'wing': pygame.mixer.Sound('assets/audio/wing.wav'),
                 'hit': pygame.mixer.Sound('assets/audio/hit.wav'),
                 'die': pygame.mixer.Sound('assets/audio/die.wav'),
                 'point': pygame.mixer.Sound('assets/audio/point.wav')
             }
+            
+            # Set individual volumes (0.0 to 1.0)
+            self.sounds['wing'].set_volume(0.6)
+            self.sounds['hit'].set_volume(0.6)
+            self.sounds['die'].set_volume(0.6)
+            self.sounds['point'].set_volume(0.3)  # Reduced point sound volume
             
             self.reset_game()
             self.game_state = GAME_STATE_START
@@ -418,8 +466,9 @@ class Config:
 
     @classmethod
     def load_from_file(cls, filepath):
-        # Load configuration from JSON/YAML file
-        pass
+        with open(filepath, 'r') as f:
+            config_data = yaml.safe_load(f)
+        return cls.from_dict(config_data)
 
 class PerformanceMonitor:
     def __init__(self):
